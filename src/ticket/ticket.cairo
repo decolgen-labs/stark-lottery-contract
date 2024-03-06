@@ -1,23 +1,14 @@
-use array::Array;
-use starknet::ContractAddress;
-
-#[starknet::interface]
-trait ITicket<TContractState> {
-    fn createTicket(
-        ref self: TContractState,
-        pickedNumbers: Array::<u32>,
-        lotteryId: u128,
-        userAddress: ContractAddress
-    ) -> u128;
-    fn setPaidOut(ref self: TContractState, ticketId: u128, payOut: u256);
-}
-
 #[starknet::contract]
 mod Ticket {
+    use core::clone::Clone;
+    use lottery::governance::interface::IGovernanceDispatcherTrait;
+    use lottery::ticket::interface::{ITicket, TicketHash, TicketGetter};
+    use lottery::governance::interface::IGovernanceDispatcher;
     use core::serde::Serde;
     use core::traits::TryInto;
     use core::array::ArrayTrait;
-    use super::{ContractAddress, ITicket, Array};
+    use starknet::ContractAddress;
+    use array::{Array, Span};
     use starknet::{get_caller_address};
     use alexandria_storage::list::{List, ListTrait};
     use pedersen::{PedersenTrait, HashState};
@@ -34,6 +25,13 @@ mod Ticket {
         combinationCounter: LegacyMap::<felt252, u128>,
         // Mapping user => list of tickets ID
         users: LegacyMap::<ContractAddress, List<u128>>,
+        governanceContract: IGovernanceDispatcher
+    }
+
+    // ----------------- Constructor -----------------
+    #[constructor]
+    fn constructor(ref self: ContractState, governanceAddress: ContractAddress) {
+        self.governanceContract.write(IGovernanceDispatcher { contract_address: governanceAddress })
     }
 
     // ------------------- Structs -------------------
@@ -44,25 +42,6 @@ mod Ticket {
         pickedNumbers: List<u32>,
         payOut: u256,
         user: ContractAddress
-    }
-
-    #[derive(Drop, Serde)]
-    struct TicketGetter {
-        ticketId: u128,
-        lotteryAddress: ContractAddress,
-        lotteryId: u128,
-        pickedNumbers: Array::<u32>,
-        payOut: u256,
-        user: ContractAddress,
-        sameCombinationCounter: u128,
-    }
-
-    // use as a param to map with the same combination picked numbers
-    #[derive(Drop)]
-    struct TicketHash {
-        lotteryAddress: ContractAddress,
-        lotteryId: u128,
-        pickedNumbers: Array::<u32>,
     }
 
     // -------------------- Events --------------------
@@ -76,7 +55,10 @@ mod Ticket {
     struct TicketCreated {
         #[key]
         ticketId: u128,
-        user: ContractAddress
+        user: ContractAddress,
+        lotteryAddress: ContractAddress,
+        lotteryId: u128,
+        pickedNumbers: Array::<u32>,
     }
 
     // --------------- External Accessors ---------------
@@ -88,9 +70,15 @@ mod Ticket {
             lotteryId: u128,
             userAddress: ContractAddress
         ) -> u128 {
+            let lotteryAddress = get_caller_address();
+            assert(
+                self.governanceContract.read().validateLottery(lotteryAddress),
+                'Lottery is inactive'
+            );
+
             let ticketId = self.numberOfTickets.read() + 1;
             let mut newTicket = self.mappingTicket.read(ticketId);
-            newTicket.lotteryAddress = get_caller_address();
+            newTicket.lotteryAddress = lotteryAddress;
             newTicket.lotteryId = lotteryId;
             newTicket.pickedNumbers.from_array(@pickedNumbers);
             newTicket.user = userAddress;
@@ -98,9 +86,7 @@ mod Ticket {
             self.mappingTicket.write(ticketId, newTicket);
 
             let params = TicketHash {
-                lotteryAddress: get_caller_address(),
-                lotteryId: lotteryId,
-                pickedNumbers: pickedNumbers
+                lotteryAddress, lotteryId, pickedNumbers: pickedNumbers.span()
             };
 
             // Counting number of combination of picked numbers
@@ -114,25 +100,34 @@ mod Ticket {
 
             self.numberOfTickets.write(self.numberOfTickets.read() + 1);
 
-            self.emit(TicketCreated { ticketId, user: userAddress });
+            self
+                .emit(
+                    TicketCreated {
+                        ticketId, user: userAddress, lotteryAddress, lotteryId, pickedNumbers
+                    }
+                );
 
             ticketId
         }
 
-        fn setPaidOut(ref self: ContractState, ticketId: u128, payOut: u256) {}
-    }
+        fn setPaidOut(ref self: ContractState, ticketId: u128, payOut: u256) {
+            let lotteryAddress = get_caller_address();
+            assert(
+                self.governanceContract.read().validateLottery(lotteryAddress),
+                'Lottery is inactive'
+            );
 
-    // ----------------- View Accessors -----------------
-    #[abi(per_item)]
-    #[generate_trait]
-    impl ViewAccessors of IViewAccessors {
-        #[external(v0)]
+            let mut ticket = self.mappingTicket.read(ticketId);
+            ticket.payOut = payOut;
+            self.mappingTicket.write(ticketId, ticket);
+        }
+
         fn getTicketById(self: @ContractState, ticketId: u128) -> TicketGetter {
             let ticket = self.mappingTicket.read(ticketId);
             let ticketHash = TicketHash {
                 lotteryAddress: ticket.lotteryAddress,
                 lotteryId: ticket.lotteryId,
-                pickedNumbers: ticket.pickedNumbers.array()
+                pickedNumbers: ticket.pickedNumbers.array().span()
             };
             let sameCombinationCounter = self.combinationCounter.read(ticketHash.hashStruct());
 
@@ -147,6 +142,15 @@ mod Ticket {
             };
         }
 
+        fn getCombinationCounter(self: @ContractState, param: TicketHash) -> u128 {
+            self.combinationCounter.read(param.hashStruct())
+        }
+    }
+
+    // ----------------- View Accessors -----------------
+    #[abi(per_item)]
+    #[generate_trait]
+    impl ViewAccessors of IViewAccessors {
         #[external(v0)]
         fn getSerializePickedNumbers(
             self: @ContractState, pickedNumbers: Array::<u32>
@@ -173,7 +177,4 @@ mod Ticket {
             state.finalize()
         }
     }
-
-    #[generate_trait]
-    impl Private of PrivateTrait {}
 }
