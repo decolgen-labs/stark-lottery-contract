@@ -1,14 +1,10 @@
 #[starknet::contract]
 mod Ticket {
-    use core::clone::Clone;
     use lottery::governance::interface::IGovernanceDispatcherTrait;
     use lottery::ticket::interface::{ITicket, TicketHash, TicketGetter};
     use lottery::governance::interface::IGovernanceDispatcher;
-    use core::serde::Serde;
-    use core::traits::TryInto;
-    use core::array::ArrayTrait;
     use starknet::ContractAddress;
-    use array::{Array, Span};
+    use array::{Array, Span, ArrayTrait};
     use starknet::{get_caller_address};
     use alexandria_storage::list::{List, ListTrait};
     use pedersen::{PedersenTrait, HashState};
@@ -158,6 +154,11 @@ mod Ticket {
             let mut pickedNumberFelt252 = ArrayTrait::<felt252>::new();
             pickedNumbers.serialize(ref pickedNumberFelt252);
             pickedNumberFelt252
+        }
+
+        #[external(v0)]
+        fn getUserTickets(self: @ContractState, userAddress: ContractAddress) -> Span::<u128> {
+            self.users.read(userAddress).array().span()
         }
     }
 
