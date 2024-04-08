@@ -35,9 +35,10 @@ mod Governance {
         lotteries: LegacyMap::<ContractAddress, Lottery>,
         // list of active lotteries
         activeLotteries: List<ContractAddress>,
+        jackpotPool: u256,
         currency: ContractAddress,
-        totalBalance: u256,
         rewardPool: u256,
+        feeRecipient: ContractAddress,
         #[substorage(v0)]
         ownable: OwnableComponent::Storage,
         #[substorage(v0)]
@@ -60,8 +61,9 @@ mod Governance {
         isActive: bool, // True if the lottery if active
         minimumPrice: u256, // Minimum price of the lottery ticket with minimum selected numbers
         initialJackpot: u256, // Starting jackpot amount
-        firstDrawTime: u64, // Time of the first lottery draw
-        duration: u64, // Lottery duration
+        firstStartTime: u64, // Time of the first lottery draw
+        durationStartTime: u64, // Lottery duration start time
+        durationBuyTicket: u64, // Lottery duration buying ticket
         // The percentage based on the total value of tickets sold increase the jackpot 
         // after each game if no one wins
         increaseJackpot: u128,
@@ -70,9 +72,15 @@ mod Governance {
 
     // ----------------- Constructor -----------------
     #[constructor]
-    fn constructor(ref self: ContractState, admin: ContractAddress, currency: ContractAddress) {
+    fn constructor(
+        ref self: ContractState,
+        admin: ContractAddress,
+        currency: ContractAddress,
+        feeRecipient: ContractAddress,
+    ) {
         self.ownable.initializer(admin);
         self.currency.write(currency);
+        self.feeRecipient.write(feeRecipient);
     }
 
     #[abi(embed_v0)]
@@ -81,6 +89,13 @@ mod Governance {
             self.ownable.assert_only_owner();
             self.ownable.initializer(newAdmin);
         }
+
+        fn changeFeeRecipient(ref self: ContractState, newFeeRecipient: ContractAddress) {
+            self.ownable.assert_only_owner();
+            assert(newFeeRecipient.is_non_zero(), 'Only Allow None Zero Address');
+            self.feeRecipient.write(newFeeRecipient);
+        }
+
 
         fn changeRandomness(ref self: ContractState, newRandom: ContractAddress) {
             self.ownable.assert_only_owner();
@@ -121,15 +136,28 @@ mod Governance {
             self.lotteries.write(lottery, lotteryDetail);
         }
 
-        fn changeDuration(ref self: ContractState, lottery: ContractAddress, newDuration: u64) {
+        fn changeDurationStartTime(
+            ref self: ContractState, lottery: ContractAddress, newDuration: u64
+        ) {
+            self.ownable.assert_only_owner();
+            let mut lotteryDetail: Lottery = self.lotteries.read(lottery);
+            assert(newDuration != lotteryDetail.durationStartTime, 'Wrong duration');
+
+            lotteryDetail.durationStartTime = newDuration;
+            self.lotteries.write(lottery, lotteryDetail);
+        }
+
+        fn changeDurationBuyTicket(
+            ref self: ContractState, lottery: ContractAddress, newDuration: u64
+        ) {
             self.ownable.assert_only_owner();
             let mut lotteryDetail: Lottery = self.lotteries.read(lottery);
             assert(
-                newDuration >= MIN_DURATION && newDuration != lotteryDetail.duration,
+                newDuration >= MIN_DURATION && newDuration != lotteryDetail.durationBuyTicket,
                 'Wrong duration'
             );
 
-            lotteryDetail.duration = newDuration;
+            lotteryDetail.durationBuyTicket = newDuration;
             self.lotteries.write(lottery, lotteryDetail);
         }
 
@@ -137,15 +165,17 @@ mod Governance {
             ref self: ContractState,
             lottery: ContractAddress,
             minimumPrice: u256,
-            duration: u64,
+            durationStartTime: u64,
+            durationBuyTicket: u64,
             initialJackpot: u256,
             increaseJackpot: u128,
-            firstDrawTime: u64,
+            firstStartTime: u64,
         ) {
             self.ownable.assert_only_owner();
             assert(lottery.is_non_zero(), 'Require non-zero lottery');
             assert(minimumPrice > 0, 'Wrong minimum price');
-            assert(duration >= MIN_DURATION, 'Wrong duration');
+            assert(durationStartTime >= MIN_DURATION, 'Wrong duration');
+            assert(durationBuyTicket >= MIN_DURATION, 'Wrong duration');
 
             let mut lotteryDetail: Lottery = self.lotteries.read(lottery);
             assert(!lotteryDetail.isActive, 'Lottery already active');
@@ -156,8 +186,9 @@ mod Governance {
 
             lotteryDetail.isActive = true;
             lotteryDetail.minimumPrice = minimumPrice;
-            lotteryDetail.duration = duration;
-            lotteryDetail.firstDrawTime = firstDrawTime;
+            lotteryDetail.durationBuyTicket = durationBuyTicket;
+            lotteryDetail.durationStartTime = durationStartTime;
+            lotteryDetail.firstStartTime = firstStartTime;
             lotteryDetail.initialJackpot = initialJackpot;
             lotteryDetail.increaseJackpot = increaseJackpot;
             lotteryDetail.index = index;
@@ -197,23 +228,29 @@ mod Governance {
 
             let ticketPrice = self.getMinimumPrice(lottery);
             IERC20CamelDispatcher { contract_address: self.currency.read() }
-                .transferFrom(buyer, get_contract_address(), ticketPrice);
-
-            let mut totalBalance = self.getTotalBalance();
-            totalBalance += ticketPrice;
-            self.totalBalance.write(totalBalance);
+                .transferFrom(buyer, self.feeRecipient.read(), ticketPrice);
         }
 
-        fn payoutWinner(ref self: ContractState, winner: ContractAddress, amount: u256) {
+        fn payoutWinner(
+            ref self: ContractState, winner: ContractAddress, amount: u256, isJackpotWinner: bool
+        ) {
             self.reentrancy.start();
             let lottery = get_caller_address();
             assert(self.validateLottery(lottery), 'Caller must be lottery');
 
-            assert(amount <= self.rewardPool.read(), 'Insufficient reward pool');
+            if isJackpotWinner {
+                assert(amount <= self.jackpotPool.read(), 'Insufficient jackpot pool');
 
-            self.rewardPool.write(self.rewardPool.read() - amount);
-            IERC20CamelDispatcher { contract_address: self.currency.read() }
-                .transfer(winner, amount);
+                self.jackpotPool.write(self.jackpotPool.read() - amount);
+                IERC20CamelDispatcher { contract_address: self.currency.read() }
+                    .transfer(winner, amount);
+            } else {
+                assert(amount <= self.rewardPool.read(), 'Insufficient reward pool');
+
+                self.rewardPool.write(self.rewardPool.read() - amount);
+                IERC20CamelDispatcher { contract_address: self.currency.read() }
+                    .transfer(winner, amount);
+            }
 
             self.reentrancy.end();
         }
@@ -232,6 +269,10 @@ mod Governance {
             self.ownable.owner()
         }
 
+        fn getJackpotPool(self: @ContractState) -> u256 {
+            self.jackpotPool.read()
+        }
+
         fn getRandomnessContract(self: @ContractState) -> ContractAddress {
             self.randomnessContract.read()
         }
@@ -247,20 +288,24 @@ mod Governance {
             self.getLottery(lottery).minimumPrice
         }
 
-        fn getDuration(self: @ContractState, lottery: ContractAddress) -> u64 {
-            self.getLottery(lottery).duration
+        fn getDurationStartTime(self: @ContractState, lottery: ContractAddress) -> u64 {
+            self.getLottery(lottery).durationStartTime
+        }
+
+        fn getDurationBuyTicket(self: @ContractState, lottery: ContractAddress) -> u64 {
+            self.getLottery(lottery).durationBuyTicket
         }
 
         fn getInitialJackpot(self: @ContractState, lottery: ContractAddress) -> u256 {
             self.getLottery(lottery).initialJackpot
         }
 
-        fn getFirstDrawtime(self: @ContractState, lottery: ContractAddress) -> u64 {
-            self.getLottery(lottery).firstDrawTime
+        fn getFirstStartTime(self: @ContractState, lottery: ContractAddress) -> u64 {
+            self.getLottery(lottery).firstStartTime
         }
 
-        fn getActiveLotteries(self: @ContractState) -> Array::<ContractAddress> {
-            self.activeLotteries.read().array()
+        fn getActiveLotteries(self: @ContractState) -> Span::<ContractAddress> {
+            self.activeLotteries.read().array().span()
         }
     }
 
@@ -273,28 +318,43 @@ mod Governance {
         }
 
         #[external(v0)]
-        fn getTotalBalance(self: @ContractState) -> u256 {
-            self.totalBalance.read()
-        }
-
-        #[external(v0)]
-        fn withdrawBalance(ref self: ContractState, amount: u256) {
+        fn withdrawRewardPool(ref self: ContractState, amount: u256) {
             self.ownable.assert_only_owner();
 
-            assert(amount <= self.totalBalance.read(), 'Insufficient Balance');
-            self.totalBalance.write(self.totalBalance.read() - amount);
+            assert(amount <= self.rewardPool.read(), 'Insufficient Balance');
 
+            self.rewardPool.write(self.rewardPool.read() - amount);
             IERC20CamelDispatcher { contract_address: self.currency.read() }
                 .transfer(get_caller_address(), amount);
         }
 
         #[external(v0)]
-        fn topupPool(ref self: ContractState, amount: u256) {
+        fn withdrawJackpotPool(ref self: ContractState, amount: u256) {
+            self.ownable.assert_only_owner();
+
+            assert(amount <= self.jackpotPool.read(), 'Insufficient Balance');
+
+            self.jackpotPool.write(self.jackpotPool.read() - amount);
+            IERC20CamelDispatcher { contract_address: self.currency.read() }
+                .transfer(get_caller_address(), amount);
+        }
+
+        #[external(v0)]
+        fn topupRewardPool(ref self: ContractState, amount: u256) {
             self.ownable.assert_only_owner();
 
             IERC20CamelDispatcher { contract_address: self.currency.read() }
                 .transferFrom(get_caller_address(), get_contract_address(), amount);
             self.rewardPool.write(self.rewardPool.read() + amount);
+        }
+
+        #[external(v0)]
+        fn topupJackpotPool(ref self: ContractState, amount: u256) {
+            self.ownable.assert_only_owner();
+
+            IERC20CamelDispatcher { contract_address: self.currency.read() }
+                .transferFrom(get_caller_address(), get_contract_address(), amount);
+            self.jackpotPool.write(self.jackpotPool.read() + amount);
         }
 
         #[external(v0)]

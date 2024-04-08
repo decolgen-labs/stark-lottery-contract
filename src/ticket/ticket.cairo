@@ -3,6 +3,7 @@ mod Ticket {
     use lottery::governance::interface::IGovernanceDispatcherTrait;
     use lottery::ticket::interface::{ITicket, TicketHash, TicketGetter};
     use lottery::governance::interface::IGovernanceDispatcher;
+    use openzeppelin::access::ownable::OwnableComponent;
     use starknet::ContractAddress;
     use array::{Array, Span, ArrayTrait};
     use starknet::{get_caller_address};
@@ -10,6 +11,13 @@ mod Ticket {
     use pedersen::{PedersenTrait, HashState};
     use poseidon::poseidon_hash_span;
     use hash::{HashStateTrait, HashStateExTrait};
+
+    component!(path: OwnableComponent, storage: ownable, event: OwnableEvent);
+
+    #[abi(embed_v0)]
+    impl OwnableImpl = OwnableComponent::OwnableImpl<ContractState>;
+
+    impl OwnableInternalImpl = OwnableComponent::InternalImpl<ContractState>;
 
     // ------------------- Storage -------------------
     #[storage]
@@ -21,12 +29,17 @@ mod Ticket {
         combinationCounter: LegacyMap::<felt252, u128>,
         // Mapping user => list of tickets ID
         users: LegacyMap::<ContractAddress, List<u128>>,
-        governanceContract: IGovernanceDispatcher
+        governanceContract: IGovernanceDispatcher,
+        #[substorage(v0)]
+        ownable: OwnableComponent::Storage
     }
 
     // ----------------- Constructor -----------------
     #[constructor]
-    fn constructor(ref self: ContractState, governanceAddress: ContractAddress) {
+    fn constructor(
+        ref self: ContractState, owner: ContractAddress, governanceAddress: ContractAddress
+    ) {
+        self.ownable.initializer(owner);
         self.governanceContract.write(IGovernanceDispatcher { contract_address: governanceAddress })
     }
 
@@ -45,6 +58,8 @@ mod Ticket {
     #[derive(Drop, starknet::Event)]
     enum Event {
         TicketCreated: TicketCreated,
+        #[flat]
+        OwnableEvent: OwnableComponent::Event,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -131,12 +146,31 @@ mod Ticket {
                 ticketId,
                 lotteryAddress: ticket.lotteryAddress,
                 lotteryId: ticket.lotteryId,
-                pickedNumbers: ticket.pickedNumbers.array(),
+                pickedNumbers: ticket.pickedNumbers.array().span(),
                 payOut: ticket.payOut,
                 user: ticket.user,
                 sameCombinationCounter
             };
         }
+
+        fn getTicketByIds(self: @ContractState, ticketIds: Array::<u128>) -> Array::<TicketGetter> {
+            let mut result = ArrayTrait::<TicketGetter>::new();
+            let idsLength = ticketIds.len();
+
+            let mut index: u32 = 0;
+            let tickets = loop {
+                if index == idsLength {
+                    break result.clone();
+                }
+
+                let ticket = self.getTicketById(*ticketIds.at(index));
+                result.append(ticket);
+                index += 1;
+            };
+
+            tickets
+        }
+
 
         fn getCombinationCounter(self: @ContractState, param: TicketHash) -> u128 {
             self.combinationCounter.read(param.hashStruct())
@@ -154,6 +188,14 @@ mod Ticket {
             let mut pickedNumberFelt252 = ArrayTrait::<felt252>::new();
             pickedNumbers.serialize(ref pickedNumberFelt252);
             pickedNumberFelt252
+        }
+
+        #[external(v0)]
+        fn changeGorvernanceContract(ref self: ContractState, newGorvernance: ContractAddress) {
+            self.ownable.assert_only_owner();
+            self
+                .governanceContract
+                .write(IGovernanceDispatcher { contract_address: newGorvernance });
         }
 
         #[external(v0)]

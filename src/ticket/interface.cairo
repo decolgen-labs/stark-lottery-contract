@@ -8,12 +8,12 @@ struct TicketHash {
     pickedNumbers: Span::<u32>,
 }
 
-#[derive(Drop, Serde)]
+#[derive(Drop, Copy, Serde)]
 struct TicketGetter {
     ticketId: u128,
     lotteryAddress: ContractAddress,
     lotteryId: u128,
-    pickedNumbers: Array::<u32>,
+    pickedNumbers: Span::<u32>,
     payOut: u256,
     user: ContractAddress,
     sameCombinationCounter: u128,
@@ -30,4 +30,5 @@ trait ITicket<TContractState> {
     fn setPaidOut(ref self: TContractState, ticketId: u128, payOut: u256);
     fn getCombinationCounter(self: @TContractState, param: TicketHash) -> u128;
     fn getTicketById(self: @TContractState, ticketId: u128) -> TicketGetter;
+    fn getTicketByIds(self: @TContractState, ticketIds: Array::<u128>) -> Array::<TicketGetter>;
 }

@@ -4,6 +4,7 @@ mod Randomness {
         IRandomness, IPragmaRandomnessDispatcher, IPragmaRandomnessDispatcherTrait
     };
     use lottery::governance::interface::{IGovernanceDispatcher, IGovernanceDispatcherTrait};
+    use lottery::lottery::interface::{ILotteryDispatcher, ILotteryDispatcherTrait};
     use openzeppelin::access::ownable::OwnableComponent;
     use openzeppelin::token::erc20::interface::{IERC20CamelDispatcher, IERC20CamelDispatcherTrait};
     use starknet::{
@@ -33,7 +34,6 @@ mod Randomness {
         lastRandomStorage: LegacyMap::<ContractAddress, felt252>,
         callbackFeeLimit: u128,
         governanceContract: IGovernanceDispatcher,
-        totalETHBalance: u256,
         requestIdtoAddress: LegacyMap::<u64, ContractAddress>,
         #[substorage(v0)]
         ownable: OwnableComponent::Storage,
@@ -65,7 +65,7 @@ mod Randomness {
 
     #[abi(embed_v0)]
     impl RandomnessImpl of IRandomness<ContractState> {
-        fn getRandom(ref self: ContractState, signature: Span<felt252>) {
+        fn getRandom(ref self: ContractState, signature: Span<felt252>,) {
             let governance = self.governanceContract.read();
             let lottery = get_caller_address();
             assert(governance.validateLottery(lottery), 'Invalid lottery');
@@ -76,6 +76,7 @@ mod Randomness {
             };
 
             let computeFee = vrfContractDispatcher.compute_premium_fee(lottery);
+            let additionFee: u128 = 60000000000000000;
             // IERC20CamelDispatcher { contract_address: self.ETHAddress.read() }
             //     .approve(vrfContract, computeFee.into());
 
@@ -84,7 +85,7 @@ mod Randomness {
                 .request_random(
                     self.getSeed(signature),
                     get_contract_address(),
-                    computeFee,
+                    computeFee + additionFee,
                     self.publishDelay.read(),
                     numWord,
                     ArrayTrait::<felt252>::new()
@@ -116,6 +117,7 @@ mod Randomness {
 
             let random_word = *random_words.at(0);
             self.lastRandomStorage.write(lottery, random_word);
+            ILotteryDispatcher { contract_address: lottery }.fulfillDrawing(random_word);
         }
     }
 
@@ -162,19 +164,13 @@ mod Randomness {
             assert(amount > 0, 'Invalid amount');
             IERC20CamelDispatcher { contract_address: self.ETHAddress.read() }
                 .transferFrom(get_caller_address(), get_contract_address(), amount);
-
-            self.totalETHBalance.write(self.totalETHBalance.read() + amount);
         }
 
         #[external(v0)]
         fn withdrawBalance(ref self: ContractState, amount: u256) {
             self.ownable.assert_only_owner();
-            assert(amount <= self.getTotalETHBalance(), 'Insufficient Balance');
-
             IERC20CamelDispatcher { contract_address: self.ETHAddress.read() }
                 .transfer(get_caller_address(), amount);
-
-            self.totalETHBalance.write(self.totalETHBalance.read() - amount);
         }
 
         #[external(v0)]
@@ -182,11 +178,6 @@ mod Randomness {
             self.ownable.assert_only_owner();
             IERC20CamelDispatcher { contract_address: self.ETHAddress.read() }
                 .approve(self.getVRFContract(), amount);
-        }
-
-        #[external(v0)]
-        fn getTotalETHBalance(self: @ContractState) -> u256 {
-            self.totalETHBalance.read()
         }
 
         #[external(v0)]
@@ -227,16 +218,8 @@ mod Randomness {
             hash = hash.update_with(blockTime);
             hash = hash.update_with(3);
             let result: u256 = hash.finalize().into();
-            let mut result_u128 = result.low / BoundedU64::max().into();
-            let result_u64: u64 = loop {
-                if result_u128 < BoundedU64::max().into() {
-                    break result_u128.try_into().unwrap();
-                }
-
-                result_u128 - 1;
-            };
-
-            result_u64
+            let result_u64 = result % BoundedU64::max().into();
+            result_u64.try_into().unwrap()
         }
     }
 }

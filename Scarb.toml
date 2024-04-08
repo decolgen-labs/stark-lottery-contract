@@ -10,3 +10,4 @@ alexandria_storage = { git = "https://github.com/keep-starknet-strange/alexandri
 
 [[target.starknet-contract]]
 sierra = true
+casm = true

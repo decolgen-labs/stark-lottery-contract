@@ -4,7 +4,10 @@ mod Lottery645 {
     use alexandria_storage::list::ListTrait;
     use lottery::ticket::interface::ITicketDispatcherTrait;
     use lottery::governance::interface::{IGovernanceDispatcher, IGovernanceDispatcherTrait};
-    use lottery::lottery::interface::{LotteryDetail, ILottery, LotteryGetterStruct};
+    use lottery::lottery::interface::{
+        LotteryDetail, ILottery, LotteryGetterStruct, IMerkleVerifyDispatcher,
+        IMerkleVerifyDispatcherTrait, WhitelistDetail
+    };
     use lottery::ticket::interface::{ITicketDispatcher, TicketHash};
     use lottery::randomness::interface::{IRandomnessDispatcher, IRandomnessDispatcherTrait};
     use openzeppelin::access::ownable::OwnableComponent;
@@ -36,7 +39,7 @@ mod Lottery645 {
     // ------------------- Storage -------------------
     #[storage]
     struct Storage {
-        governanceContract: IGovernanceDispatcher,
+        governanceContract: ContractAddress,
         // current lottery id
         lotteryId: u128,
         // mapping lottery id => detail
@@ -44,6 +47,10 @@ mod Lottery645 {
         // mapping (lottery id , number) => true if is was drawn
         isDrawnNumber: LegacyMap::<(u128, u32), bool>,
         prizeMultipliers: LegacyMap::<u8, u16>,
+        whitelistState: LegacyMap::<ContractAddress, WhitelistDetail>,
+        // mapping (user address, whitelist address) => number of usage
+        counterBuyWhitelist: LegacyMap::<(ContractAddress, ContractAddress), u128>,
+        nexStartDay: u8,
         #[substorage(v0)]
         ownable: OwnableComponent::Storage,
         #[substorage(v0)]
@@ -53,16 +60,18 @@ mod Lottery645 {
     // ------------------- Constructor -------------------
     #[constructor]
     fn constructor(
-        ref self: ContractState, owner: ContractAddress, governanceAddress: ContractAddress
+        ref self: ContractState,
+        owner: ContractAddress,
+        governanceAddress: ContractAddress,
+        startDay: u8
     ) {
         self.ownable.initializer(owner);
-        self
-            .governanceContract
-            .write(IGovernanceDispatcher { contract_address: governanceAddress });
+        self.governanceContract.write(governanceAddress);
+        self.nexStartDay.write(startDay);
         self.prizeMultipliers.write(2, 1);
         self.prizeMultipliers.write(3, 3);
         self.prizeMultipliers.write(4, 30);
-        self.prizeMultipliers.write(5, 2000);
+        self.prizeMultipliers.write(5, 1000);
     }
 
     // --------------------- Event ---------------------
@@ -89,6 +98,7 @@ mod Lottery645 {
     struct StartNewLottery {
         #[key]
         id: u128,
+        startTime: u64,
         drawTime: u64,
         jackpot: u256
     }
@@ -112,65 +122,9 @@ mod Lottery645 {
 
     #[abi(embed_v0)]
     impl LotteryImpl of ILottery<ContractState> {
-        fn startNewLottery(ref self: ContractState) {
+        fn manualStartNewLottery(ref self: ContractState, startDay: u8) {
             self.ownable.assert_only_owner();
-            let governance = self.governanceContract.read();
-            let thisLottery = get_contract_address();
-            assert(governance.validateLottery(thisLottery), 'Invalid Lottery');
-            let currentDrawId = self.lotteryId.read();
-            let mut timeOfNextDraw: u64 = 0;
-            let mut initJackpot = governance.getInitialJackpot(thisLottery);
-
-            // check if current lottery id is not the first
-            if currentDrawId != 0 {
-                let currentLottery = self.lotteries.read(currentDrawId);
-                assert(currentLottery.state == 0, 'Current lottery must be closed');
-
-                let presetDuration = governance.getDuration(thisLottery);
-                timeOfNextDraw = currentLottery.drawTime + presetDuration;
-                loop {
-                    if get_block_timestamp() < timeOfNextDraw {
-                        break;
-                    }
-
-                    timeOfNextDraw += presetDuration;
-                };
-
-                // compute the jackpot for next draw
-                let winnerTicketHash = TicketHash {
-                    lotteryAddress: thisLottery,
-                    lotteryId: currentDrawId,
-                    pickedNumbers: currentLottery.drawnNumbers.array().span()
-                };
-                let isHasWinner = ITicketDispatcher {
-                    contract_address: governance.getTicketContract()
-                }
-                    .getCombinationCounter(winnerTicketHash) > 0;
-
-                if !isHasWinner {
-                    let preTotalValue = currentLottery.totalValue;
-                    initJackpot += governance.computeGrowingJackPot(thisLottery, preTotalValue);
-                }
-            } else {
-                timeOfNextDraw = governance.getFirstDrawtime(thisLottery);
-            }
-
-            let newDrawId = currentDrawId + 1;
-            let mut newDrawDetail = self.lotteries.read(newDrawId);
-            newDrawDetail.lotteryId = newDrawId;
-            newDrawDetail.minimumPrice = governance.getMinimumPrice(thisLottery);
-            newDrawDetail.state = 1;
-            newDrawDetail.drawTime = timeOfNextDraw;
-            newDrawDetail.totalValue = 0;
-            newDrawDetail.jackpot = initJackpot;
-            self.lotteries.write(newDrawId, newDrawDetail);
-            self.lotteryId.write(newDrawId);
-            self
-                .emit(
-                    StartNewLottery {
-                        id: newDrawId, drawTime: timeOfNextDraw, jackpot: initJackpot
-                    }
-                )
+            self.startNewLottery(startDay);
         }
 
         fn buyTicket(ref self: ContractState, pickedNumbers: Span::<u32>) {
@@ -178,40 +132,52 @@ mod Lottery645 {
             let currentLotteryId = self.lotteryId.read();
             let mut lotteryDetail = self.lotteries.read(currentLotteryId);
 
-            assert(lotteryDetail.state == 1, 'Ticket sale not open');
-            assert(get_block_timestamp() < lotteryDetail.drawTime - 300, 'Ticket sale is closed');
-            assert(pickedNumbers.len() == MUST_PICK_NUMBERS.into(), 'Wrong picked numbers');
-
+            let arrayPickedNumbers = self.validateBuyingTicket(@lotteryDetail, pickedNumbers);
             let ticketPrice = lotteryDetail.minimumPrice;
 
-            // check unique and numbers is in range 1 - MAXNUMBER
-            let mut index: u32 = 0;
-            let mut arrayPickedNumbers = ArrayTrait::<u32>::new();
-            arrayPickedNumbers = loop {
-                if index == MUST_PICK_NUMBERS.into() {
-                    break arrayPickedNumbers.clone();
-                }
-
-                let pickedNumer = *pickedNumbers.at(index);
-                assert(pickedNumer >= 1 && pickedNumer <= MAX_NUMBER, 'Wrong picked number');
-                if index > 0 {
-                    let preNumber = *pickedNumbers.at(index - 1);
-                    assert(preNumber < pickedNumer, 'Only sorted and unique numbers');
-                }
-
-                arrayPickedNumbers.append(pickedNumer);
-                index += 1;
-            };
-
             let buyer = get_caller_address();
-            let governance = self.governanceContract.read();
+            let governance = IGovernanceDispatcher {
+                contract_address: self.governanceContract.read()
+            };
+            lotteryDetail.totalValue += ticketPrice;
+            self.lotteries.write(currentLotteryId, lotteryDetail);
             governance.payTicketPrice(buyer);
 
             let newTicket = ITicketDispatcher { contract_address: governance.getTicketContract() }
                 .createTicket(arrayPickedNumbers, currentLotteryId, buyer);
 
-            lotteryDetail.totalValue += ticketPrice;
-            self.lotteries.write(currentLotteryId, lotteryDetail);
+            self.reentrancy.end();
+        }
+
+        fn buyWhitelistTicket(
+            ref self: ContractState,
+            whitelistAddress: ContractAddress,
+            maxAmount: u128,
+            proof: Array<felt252>,
+            pickedNumbers: Span::<u32>
+        ) {
+            self.reentrancy.start();
+            let buyer = get_caller_address();
+            self.validateWhitelistState(buyer, whitelistAddress, maxAmount, proof);
+
+            let currentLotteryId = self.lotteryId.read();
+            let mut lotteryDetail = self.lotteries.read(currentLotteryId);
+
+            let arrayPickedNumbers = self.validateBuyingTicket(@lotteryDetail, pickedNumbers);
+
+            self
+                .counterBuyWhitelist
+                .write(
+                    (buyer, whitelistAddress),
+                    self.counterBuyWhitelist.read((buyer, whitelistAddress)) + 1
+                );
+
+            let governance = IGovernanceDispatcher {
+                contract_address: self.governanceContract.read()
+            };
+            let newTicket = ITicketDispatcher { contract_address: governance.getTicketContract() }
+                .createTicket(arrayPickedNumbers, currentLotteryId, buyer);
+
             self.reentrancy.end();
         }
 
@@ -219,12 +185,15 @@ mod Lottery645 {
             self.ownable.assert_only_owner();
             let currentLotteryId = self.lotteryId.read();
             let mut lotteryDetail = self.lotteries.read(currentLotteryId);
+            assert(lotteryDetail.state == 1, 'Wrong lottery');
             let drawTime = lotteryDetail.drawTime;
 
             assert(get_block_timestamp() >= drawTime, 'Not yet to draw');
             let totalValue = lotteryDetail.totalValue;
 
-            let governance = self.governanceContract.read();
+            let governance = IGovernanceDispatcher {
+                contract_address: self.governanceContract.read()
+            };
             let thisLottery = get_contract_address();
 
             if totalValue > 0 {
@@ -232,26 +201,37 @@ mod Lottery645 {
                 newLotteryState.state = 2;
                 self.lotteries.write(currentLotteryId, newLotteryState);
                 IRandomnessDispatcher { contract_address: governance.getRandomnessContract() }
-                    .getRandom(get_tx_info().unbox().signature)
+                    .getRandom(get_tx_info().unbox().signature);
             } else {
-                let presetDuration = governance.getDuration(thisLottery);
-                let mut timeOfNextDraw = drawTime + presetDuration;
+                let presetDuration = governance.getDurationStartTime(thisLottery);
+                let mut timeOfNextStartTime = drawTime + presetDuration;
                 loop {
-                    if get_block_timestamp() < timeOfNextDraw {
+                    if get_block_timestamp() < timeOfNextStartTime {
                         break;
                     }
 
-                    timeOfNextDraw += presetDuration;
+                    timeOfNextStartTime += presetDuration;
                 };
+                let nexStartDay = self.nexStartDay.read();
+                let mut newStartDay = 1;
+                if nexStartDay == 1 {
+                    newStartDay = 5;
+                    timeOfNextStartTime += 86400
+                }
 
+                let timeOfNextDraw = timeOfNextStartTime
+                    + governance.getDurationBuyTicket(thisLottery);
                 let mut newLottery = self.lotteries.read(currentLotteryId);
+                newLottery.startTime = timeOfNextStartTime;
                 newLottery.drawTime = timeOfNextDraw;
                 self.lotteries.write(currentLotteryId, newLottery);
+                self.nexStartDay.write(newStartDay);
 
                 self
                     .emit(
                         StartNewLottery {
                             id: currentLotteryId,
+                            startTime: timeOfNextDraw,
                             drawTime: timeOfNextDraw,
                             jackpot: lotteryDetail.jackpot
                         }
@@ -261,7 +241,9 @@ mod Lottery645 {
 
         fn fulfillDrawing(ref self: ContractState, randomWord: felt252) {
             let caller = get_caller_address();
-            let mut governance = self.governanceContract.read();
+            let mut governance = IGovernanceDispatcher {
+                contract_address: self.governanceContract.read()
+            };
             assert(caller == governance.getRandomnessContract(), 'Only Randomness Contract');
 
             let currentLotteryId = self.lotteryId.read();
@@ -316,13 +298,16 @@ mod Lottery645 {
 
             self.emit(DrawnNumbers { lotteryId: currentLotteryId, drawnNumbers: result.span() });
 
-            self.startNewLottery();
+            let nexStartDay = self.nexStartDay.read();
+            self.startNewLottery(nexStartDay);
         }
 
 
         fn claimRewards(ref self: ContractState, ticketId: u128) {
             self.reentrancy.start();
-            let governance = self.governanceContract.read();
+            let governance = IGovernanceDispatcher {
+                contract_address: self.governanceContract.read()
+            };
             let ticketDispatcher = ITicketDispatcher {
                 contract_address: governance.getTicketContract()
             };
@@ -334,9 +319,14 @@ mod Lottery645 {
             assert(ticketDetail.lotteryAddress == lottery, 'Wrong Lottery');
             assert(ticketDetail.payOut == 0, 'Ticket already claimed');
 
-            let pickedNumbers = ticketDetail.pickedNumbers.span();
+            let pickedNumbers = ticketDetail.pickedNumbers;
             let lotteryId = ticketDetail.lotteryId;
             let lotteryDetail = self.lotteries.read(lotteryId);
+            assert(
+                lotteryDetail.drawTime < get_block_timestamp()
+                    && lotteryDetail.drawnNumbers.len() == MUST_PICK_NUMBERS.into(),
+                'Lottery not yet draw'
+            );
             let mut index: u32 = 0;
             let mut couter = 0;
 
@@ -355,17 +345,19 @@ mod Lottery645 {
             assert(matchedCounter >= 2, 'Ticket lost');
 
             let mut payout: u256 = 0;
+            let mut isJackpotWinner = false;
             if matchedCounter >= 2 && matchedCounter <= 5 {
                 payout = self.prizeMultipliers.read(matchedCounter).into()
                     * self.lotteries.read(lotteryId).minimumPrice;
             } else if matchedCounter == MUST_PICK_NUMBERS {
                 assert(ticketDetail.sameCombinationCounter > 0, 'Wrong Ticket');
                 payout == lotteryDetail.jackpot / ticketDetail.sameCombinationCounter.into();
+                isJackpotWinner = true
             }
 
             assert(payout > 0, 'Wrong payout amount');
             ticketDispatcher.setPaidOut(ticketId, payout);
-            governance.payoutWinner(caller, payout);
+            governance.payoutWinner(caller, payout, isJackpotWinner);
 
             self
                 .emit(
@@ -382,6 +374,7 @@ mod Lottery645 {
                     id: 0,
                     minimumPrice: 0,
                     state: 0,
+                    startTime: 0,
                     drawTime: 0,
                     drawnNumbers: array![].span(),
                     amountOfTickets: 0,
@@ -393,7 +386,9 @@ mod Lottery645 {
 
             let lotteryDetail = self.lotteries.read(currentLotteryId);
 
-            let governance = self.governanceContract.read();
+            let governance = IGovernanceDispatcher {
+                contract_address: self.governanceContract.read()
+            };
             let drawnNumbers = lotteryDetail.drawnNumbers.array().span();
 
             let amountOfTickets: u128 = (lotteryDetail.totalValue / lotteryDetail.minimumPrice)
@@ -417,6 +412,7 @@ mod Lottery645 {
                 id: lotteryDetail.lotteryId,
                 minimumPrice: lotteryDetail.minimumPrice,
                 state: lotteryDetail.state,
+                startTime: lotteryDetail.startTime,
                 drawTime: lotteryDetail.drawTime,
                 drawnNumbers: drawnNumbers,
                 amountOfTickets: amountOfTickets,
@@ -436,6 +432,7 @@ mod Lottery645 {
                     id: 0,
                     minimumPrice: 0,
                     state: 0,
+                    startTime: 0,
                     drawTime: 0,
                     drawnNumbers: array![].span(),
                     amountOfTickets: 0,
@@ -445,7 +442,9 @@ mod Lottery645 {
                 };
             }
 
-            let governance = self.governanceContract.read();
+            let governance = IGovernanceDispatcher {
+                contract_address: self.governanceContract.read()
+            };
             let drawnNumbers = lotteryDetail.drawnNumbers.array().span();
 
             let amountOfTickets: u128 = (lotteryDetail.totalValue / lotteryDetail.minimumPrice)
@@ -468,6 +467,7 @@ mod Lottery645 {
                 id: lotteryDetail.lotteryId,
                 minimumPrice: lotteryDetail.minimumPrice,
                 state: lotteryDetail.state,
+                startTime: lotteryDetail.startTime,
                 drawTime: lotteryDetail.drawTime,
                 drawnNumbers: drawnNumbers,
                 amountOfTickets: amountOfTickets,
@@ -504,7 +504,7 @@ mod Lottery645 {
         #[external(v0)]
         fn testGetRandomNumbers(
             self: @ContractState, randomWord: felt252, totalValue: u256
-        ) -> Array::<u32> {
+        ) -> Span::<u32> {
             let mut drawCount: u8 = 0;
             let mut secondArg: u128 = 0;
             let mut newDrawnNumers = ArrayTrait::<u32>::new();
@@ -546,7 +546,187 @@ mod Lottery645 {
                 secondArg += 1;
             };
 
-            result
+            result.span()
+        }
+
+        #[external(v0)]
+        fn changePrizeMultipliers(ref self: ContractState, counter: u8, multiplier: u16) {
+            self.ownable.assert_only_owner();
+            self.prizeMultipliers.write(counter, multiplier);
+        }
+
+        #[external(v0)]
+        fn getWhitelistDetail(self: @ContractState, whitelist: ContractAddress) -> WhitelistDetail {
+            self.whitelistState.read(whitelist)
+        }
+
+        #[external(v0)]
+        fn setWhitelistDetail(
+            ref self: ContractState, whitelist: ContractAddress, startTime: u64, endTime: u64
+        ) {
+            self.ownable.assert_only_owner();
+            let whitelistDetail = WhitelistDetail { startTime, endTime };
+            self.whitelistState.write(whitelist, whitelistDetail);
+        }
+
+        #[external(v0)]
+        fn changeNextStartDay(ref self: ContractState, startDay: u8) {
+            self.ownable.assert_only_owner();
+            assert(startDay == 1 || startDay == 5, 'Invalid start day');
+            self.nexStartDay.write(startDay);
+        }
+
+        #[external(v0)]
+        fn cancelLottery(ref self: ContractState, lotteryId: u128) {
+            self.ownable.assert_only_owner();
+            let mut lotteryDetail = self.lotteries.read(lotteryId);
+            lotteryDetail.state = 0;
+            self.lotteries.write(lotteryId, lotteryDetail)
+        }
+
+        #[external(v0)]
+        fn updateLottery(
+            ref self: ContractState, lotteryId: u128, startTime: u64, drawTime: u64, jackpot: u256
+        ) {
+            self.ownable.assert_only_owner();
+            let mut lotteryDetail = self.lotteries.read(lotteryId);
+            lotteryDetail.startTime = startTime;
+            lotteryDetail.drawTime = drawTime;
+            lotteryDetail.jackpot = jackpot;
+            self.lotteries.write(lotteryId, lotteryDetail)
+        }
+
+        fn startNewLottery(ref self: ContractState, startDay: u8) {
+            assert(startDay == 1 || startDay == 5, 'Invalid start day');
+            let governance = IGovernanceDispatcher {
+                contract_address: self.governanceContract.read()
+            };
+            let thisLottery = get_contract_address();
+            assert(governance.validateLottery(thisLottery), 'Invalid Lottery');
+            let currentDrawId = self.lotteryId.read();
+            let mut timeOfNextStart: u64 = 0;
+            let mut initJackpot = governance.getInitialJackpot(thisLottery);
+
+            // check if current lottery id is not the first
+            if currentDrawId != 0 {
+                let currentLottery = self.lotteries.read(currentDrawId);
+                assert(currentLottery.state == 0, 'Current lottery must be closed');
+
+                let presetDuration = governance.getDurationStartTime(thisLottery);
+                timeOfNextStart = currentLottery.startTime + presetDuration;
+                loop {
+                    if get_block_timestamp() < timeOfNextStart {
+                        break;
+                    }
+
+                    timeOfNextStart += presetDuration;
+                };
+
+                if startDay == 1 {
+                    timeOfNextStart += 86400
+                }
+
+                // compute the jackpot for next draw
+                let winnerTicketHash = TicketHash {
+                    lotteryAddress: thisLottery,
+                    lotteryId: currentDrawId,
+                    pickedNumbers: currentLottery.drawnNumbers.array().span()
+                };
+                let isHasWinner = ITicketDispatcher {
+                    contract_address: governance.getTicketContract()
+                }
+                    .getCombinationCounter(winnerTicketHash) > 0;
+
+                if !isHasWinner {
+                    let preTotalValue = currentLottery.totalValue;
+                    initJackpot += governance.computeGrowingJackPot(thisLottery, preTotalValue);
+                }
+            } else {
+                timeOfNextStart = governance.getFirstStartTime(thisLottery);
+            }
+
+            let timeOfNextDraw = timeOfNextStart + governance.getDurationBuyTicket(thisLottery);
+            let newDrawId = currentDrawId + 1;
+            let mut newDrawDetail = self.lotteries.read(newDrawId);
+            newDrawDetail.lotteryId = newDrawId;
+            newDrawDetail.minimumPrice = governance.getMinimumPrice(thisLottery);
+            newDrawDetail.state = 1;
+            newDrawDetail.drawTime = timeOfNextDraw;
+            newDrawDetail.startTime = timeOfNextStart;
+            newDrawDetail.totalValue = 0;
+            newDrawDetail.jackpot = initJackpot;
+            self.lotteries.write(newDrawId, newDrawDetail);
+            self.lotteryId.write(newDrawId);
+            let mut newStartDay = 1;
+            if startDay == 1 {
+                newStartDay = 5
+            }
+            self.nexStartDay.write(newStartDay);
+            self
+                .emit(
+                    StartNewLottery {
+                        id: newDrawId,
+                        startTime: timeOfNextStart,
+                        drawTime: timeOfNextDraw,
+                        jackpot: initJackpot
+                    }
+                )
+        }
+
+        fn validateBuyingTicket(
+            self: @ContractState, lotteryDetail: @LotteryDetail, pickedNumbers: Span::<u32>
+        ) -> Array::<u32> {
+            assert(*lotteryDetail.state == 1, 'Ticket sale not open');
+            assert(get_block_timestamp() >= *lotteryDetail.startTime, 'Ticket not yet sale');
+            assert(get_block_timestamp() < *lotteryDetail.drawTime - 300, 'Ticket sale is closed');
+            assert(pickedNumbers.len() == MUST_PICK_NUMBERS.into(), 'Wrong picked numbers');
+
+            // check unique and numbers is in range 1 - MAXNUMBER
+            let mut index: u32 = 0;
+            let mut arrayPickedNumbers = ArrayTrait::<u32>::new();
+            arrayPickedNumbers =
+                loop {
+                    if index == MUST_PICK_NUMBERS.into() {
+                        break arrayPickedNumbers.clone();
+                    }
+
+                    let pickedNumer = *pickedNumbers.at(index);
+                    assert(pickedNumer >= 1 && pickedNumer <= MAX_NUMBER, 'Wrong picked number');
+                    if index > 0 {
+                        let preNumber = *pickedNumbers.at(index - 1);
+                        assert(preNumber < pickedNumer, 'Only sorted and unique numbers');
+                    }
+
+                    arrayPickedNumbers.append(pickedNumer);
+                    index += 1;
+                };
+            arrayPickedNumbers
+        }
+
+        fn validateWhitelistState(
+            self: @ContractState,
+            userAddress: ContractAddress,
+            whitelistAddress: ContractAddress,
+            maxAmount: u128,
+            proof: Array::<felt252>
+        ) {
+            let blockTime = get_block_timestamp();
+            let whitelistState = self.whitelistState.read(whitelistAddress);
+            assert(
+                whitelistState.startTime <= blockTime && whitelistState.endTime > blockTime,
+                'Invalid Airdrop Time'
+            );
+
+            let whitelistDispatcher = IMerkleVerifyDispatcher {
+                contract_address: whitelistAddress
+            };
+            assert(
+                whitelistDispatcher.verify_from_leaf_airdrop(userAddress, maxAmount.into(), proof),
+                'User Is Not In Whitelist'
+            );
+
+            let counterUserUsage = self.counterBuyWhitelist.read((userAddress, whitelistAddress));
+            assert(counterUserUsage + 1 <= maxAmount, 'User Reach Maximum Airdropped');
         }
     }
 
@@ -566,35 +746,18 @@ mod Lottery645 {
         fn hashRandomWord(self: @RandomParam) -> felt252 {
             let block_timestamp = get_block_timestamp();
             let mut hash = PedersenTrait::new(0);
-            hash.update_with(**self.randomWord);
-            hash.update_with(block_timestamp);
-            hash.update_with(self.totalValue.hashStruct());
-            hash.update_with(*self.secondArg);
-            hash.update_with(4);
+            hash = hash.update_with(**self.randomWord);
+            hash = hash.update_with(block_timestamp);
+            hash = hash.update_with(self.totalValue.hashStruct());
+            hash = hash.update_with(*self.secondArg);
             hash.finalize()
         }
 
         fn convertToU32(self: @RandomParam) -> u32 {
             let hash = self.hashRandomWord();
             let hash_u256: u256 = hash.into();
-            let mut hash_u128 = hash_u256.low / BoundedU64::max().into();
-            let hash_u64: u64 = loop {
-                if hash_u128 <= BoundedU64::max().into() {
-                    break hash_u128.try_into().unwrap();
-                }
-
-                hash_u128 - 1;
-            };
-
-            let hash_u32: u32 = loop {
-                if hash_u64 <= BoundedU32::max().into() {
-                    break hash_u64.try_into().unwrap();
-                }
-
-                hash_u64 - 1;
-            };
-
-            hash_u32
+            let hash_u32 = hash_u256 % BoundedU32::max().into();
+            hash_u32.try_into().unwrap()
         }
     }
 }
