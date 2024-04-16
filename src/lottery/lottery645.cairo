@@ -50,6 +50,7 @@ mod Lottery645 {
         whitelistState: LegacyMap::<ContractAddress, WhitelistDetail>,
         // mapping (user address, whitelist address) => number of usage
         counterBuyWhitelist: LegacyMap::<(ContractAddress, ContractAddress), u128>,
+        canceledLotteyId: LegacyMap::<u128, bool>,
         nexStartDay: u8,
         #[substorage(v0)]
         ownable: OwnableComponent::Storage,
@@ -205,13 +206,6 @@ mod Lottery645 {
             } else {
                 let presetDuration = governance.getDurationStartTime(thisLottery);
                 let mut timeOfNextStartTime = drawTime + presetDuration;
-                loop {
-                    if get_block_timestamp() < timeOfNextStartTime {
-                        break;
-                    }
-
-                    timeOfNextStartTime += presetDuration;
-                };
                 let nexStartDay = self.nexStartDay.read();
                 let mut newStartDay = 1;
                 if nexStartDay == 1 {
@@ -322,6 +316,7 @@ mod Lottery645 {
             let pickedNumbers = ticketDetail.pickedNumbers;
             let lotteryId = ticketDetail.lotteryId;
             let lotteryDetail = self.lotteries.read(lotteryId);
+            assert(!self.isCanceledRound(lotteryId), 'Lottery is canceled');
             assert(
                 lotteryDetail.drawTime < get_block_timestamp()
                     && lotteryDetail.drawnNumbers.len() == MUST_PICK_NUMBERS.into(),
@@ -581,19 +576,33 @@ mod Lottery645 {
             self.ownable.assert_only_owner();
             let mut lotteryDetail = self.lotteries.read(lotteryId);
             lotteryDetail.state = 0;
+            self.canceledLotteyId.write(lotteryId, true);
             self.lotteries.write(lotteryId, lotteryDetail)
         }
 
         #[external(v0)]
         fn updateLottery(
-            ref self: ContractState, lotteryId: u128, startTime: u64, drawTime: u64, jackpot: u256
+            ref self: ContractState,
+            lotteryId: u128,
+            startTime: u64,
+            drawTime: u64,
+            jackpot: u256,
+            state: u8,
+            isCancelLottey: bool
         ) {
             self.ownable.assert_only_owner();
             let mut lotteryDetail = self.lotteries.read(lotteryId);
             lotteryDetail.startTime = startTime;
             lotteryDetail.drawTime = drawTime;
             lotteryDetail.jackpot = jackpot;
-            self.lotteries.write(lotteryId, lotteryDetail)
+            lotteryDetail.state = state;
+            self.lotteries.write(lotteryId, lotteryDetail);
+            self.canceledLotteyId.write(lotteryId, isCancelLottey);
+        }
+
+        #[external(v0)]
+        fn isCanceledRound(self: @ContractState, lotteryId: u128) -> bool {
+            self.canceledLotteyId.read(lotteryId)
         }
 
         fn startNewLottery(ref self: ContractState, startDay: u8) {
@@ -614,13 +623,6 @@ mod Lottery645 {
 
                 let presetDuration = governance.getDurationStartTime(thisLottery);
                 timeOfNextStart = currentLottery.startTime + presetDuration;
-                loop {
-                    if get_block_timestamp() < timeOfNextStart {
-                        break;
-                    }
-
-                    timeOfNextStart += presetDuration;
-                };
 
                 if startDay == 1 {
                     timeOfNextStart += 86400
